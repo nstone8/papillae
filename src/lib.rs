@@ -15,7 +15,12 @@ use iced::{executor, subscription, Subscription, Application, Command, Element, 
 use image::buffer::ConvertBuffer;
 use image::{ImageBuffer, Rgba, Luma, RgbaImage, Pixel};
 use ralston::{FrameSource,Frame};
-use palette::convert::IntoColor;
+use palette::convert::{FromColor,IntoColor};
+
+///trait defining some restrictions on [FrameSource]s we need to play with iced
+trait IcedFrameSource:FrameSource<ImageContainerType:Sync+Send,PixelType:Sync+Send+IntoColor<Rgba<u8>>>{}
+//implement this for all compatible [FrameSource] types
+impl<CT,PT,T: FrameSource<ImageContainerType=CT, PixelType=PT>> IcedFrameSource for T where CT:Sync+Send, PT:Sync+Send+IntoColor<Rgba<u8>> {}
 
 /*
 ///A trait representing some type of real time image analysis
@@ -142,7 +147,7 @@ impl<T:FrameSource,A:Analysis> AnalysisJob<T,A> {
 	}
 }
 
-struct AnalysisInterface<F:FrameSource,A:Analysis,V:Fn() -> F> where <F as FrameSource>::ImageContainerType: Sync + Send, <F as FrameSource>::PixelType: Sync + Send{
+struct AnalysisInterface<F:IcedFrameSource,A:Analysis,V:Fn() -> F>{
 	analysis: Arc<Mutex<A>>,
 	exposure: f64,
 	resolution_1:usize,
@@ -152,14 +157,14 @@ struct AnalysisInterface<F:FrameSource,A:Analysis,V:Fn() -> F> where <F as Frame
 	source_fn: Box<V>
 }
 
-struct InterfaceSettings<F:FrameSource,A:Analysis,V:Fn() -> F> where <F as FrameSource>::ImageContainerType: Sync + Send, <F as FrameSource>::PixelType: Sync + Send{
+struct InterfaceSettings<F:IcedFrameSource,A:Analysis,V:Fn() -> F>{
 	analysis:A,
 	source_fn:V,
 	exposure:f64,
 	resolution:[usize;2]
 }
 ///UI for an Analysis
-impl<F:FrameSource,A:Analysis,V:Fn() -> F> AnalysisInterface<F,A,V> where <F as FrameSource>::ImageContainerType: Sync + Send, <F as FrameSource>::PixelType: Sync + Send{
+impl<F:IcedFrameSource,A:Analysis,V:Fn() -> F> AnalysisInterface<F,A,V> {
 	///Create a new AnalysisInterface
 	fn new(analysis:A,source_fn:V,exposure:f64,resolution:[usize;2]) -> AnalysisInterface<F,A,V>{
 		let initial_pixels:Vec<u8> = vec![0, 0, 0, 0];
@@ -178,7 +183,8 @@ impl<F:FrameSource,A:Analysis,V:Fn() -> F> AnalysisInterface<F,A,V> where <F as 
 		AnalysisInterface::new(i.analysis,i.source_fn,i.exposure,i.resolution)
 	}
 	///Build an [iced] UI to display camera controls
-	fn build_cam_ui(&self) -> Column<'_,UiMessage,_,iced::Renderer> {
+	fn build_cam_ui<T>(&self) -> Column<'_,UiMessage,T,iced::Renderer> where
+	T:iced::widget::button::StyleSheet + iced::widget::text_input::StyleSheet  + iced::widget::text::StyleSheet{
 		//first build our base camera-control center, with the camera view, capture settings
 		//and start/preview buttons
 		let im = Image::new(self.dispframe.clone());
@@ -186,7 +192,7 @@ impl<F:FrameSource,A:Analysis,V:Fn() -> F> AnalysisInterface<F,A,V> where <F as 
 		let mut exposure = TextInput::new("exposure time",&self.exposure.to_string());
 		let mut resolution_1 = TextInput::new("h",&self.resolution_1.to_string());
 		let mut resolution_2 = TextInput::new("w",&self.resolution_2.to_string());
-		let mut preview_button = Button::new("preview");
+		let mut preview_button: Button<UiMessage,T,iced::Renderer> = Button::new("preview");
 		let mut start_button = Button::new("start");
 		let mut stop_button = Button::new("stop");
 		if self.job.is_some() {
@@ -228,7 +234,8 @@ impl<F:FrameSource,A:Analysis,V:Fn() -> F> AnalysisInterface<F,A,V> where <F as 
 	}
 }
 
-impl<F:FrameSource, A:Analysis + Send, V:Fn() -> F + Send> Application for AnalysisInterface<F,A,V> where (F::PixelType):IntoColor<Rgba<u8>>, <F as FrameSource>::ImageContainerType: Sync + Send, <F as FrameSource>::PixelType: Sync + Send{
+impl<F:IcedFrameSource, A:Analysis + Send, V:Fn() -> F + Send> Application for AnalysisInterface<F,A,V> where
+ImageBuffer<F::PixelType,F::ImageContainerType>:ConvertBuffer<ImageBuffer<Rgba<u8>,Vec<u8>>>{
 	type Message = UiMessage;
     type Executor = executor::Default;
     type Flags = InterfaceSettings<F,A,V>;
@@ -242,8 +249,8 @@ impl<F:FrameSource, A:Analysis + Send, V:Fn() -> F + Send> Application for Analy
         self.get_analysis().lock().unwrap().get_title()
     }
     fn view(&self) -> Element<'_, Self::Message, Self::Theme, iced::Renderer> {
-		let analysis_results = self.get_analysis().lock().unwrap().display_results::<'_,Self::Message,Self::Theme,iced::Renderer>();
-		Row::new().push(self::build_cam_ui::<Self::Theme, iced::Renderer>(&self)).push(analysis_results).into()
+		let analysis_results = self.get_analysis().lock().unwrap().display_results::<Self::Message,Self::Theme,iced::Renderer>();
+		Row::new().push(Self::build_cam_ui::<Self::Theme>(&self)).push(analysis_results).into()
     }
 	//pick up here, deal with mutable analyses
     fn update(&mut self, m: Self::Message) -> Command<Self::Message> {

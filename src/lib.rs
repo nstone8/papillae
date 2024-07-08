@@ -13,14 +13,14 @@ use iced::widget::text_input::TextInput;
 use iced::advanced::Renderer;
 use iced::{executor, subscription, Subscription, Application, Command, Element, Theme};
 use image::buffer::ConvertBuffer;
-use image::{ImageBuffer, Rgba, Luma, RgbaImage, Pixel};
+use image::{ImageBuffer, Rgba, RgbaImage, Pixel};
 use ralston::{FrameSource,Frame};
-use palette::convert::{FromColor,IntoColor};
+use palette::convert::IntoColor;
 
 ///trait defining some restrictions on [FrameSource]s we need to play with iced
-trait IcedFrameSource:FrameSource<ImageContainerType:Sync+Send,PixelType:Sync+Send+IntoColor<Rgba<u8>>>{}
+trait IcedFrameSource:FrameSource<ImageContainerType:Sync+Send,PixelType:Sync+Send+IntoColor<Rgba<u8>>> + 'static{}
 //implement this for all compatible [FrameSource] types
-impl<CT,PT,T: FrameSource<ImageContainerType=CT, PixelType=PT>> IcedFrameSource for T where CT:Sync+Send, PT:Sync+Send+IntoColor<Rgba<u8>> {}
+impl<CT,PT,T: FrameSource<ImageContainerType=CT, PixelType=PT> + 'static> IcedFrameSource for T where CT:Sync+Send, PT:Sync+Send+IntoColor<Rgba<u8>> {}
 
 /*
 ///A trait representing some type of real time image analysis
@@ -39,7 +39,8 @@ pub trait Analysis {
 }
 */
 
-pub trait Analysis {
+//going to make this a 'static type so we can pass it to threads
+pub trait Analysis: 'static {
 	///Need a constructor which takes no arguments for our [iced] application
 	fn new() -> Self;
 	///Return a title for the window
@@ -77,8 +78,7 @@ enum AnalysisOrPreview<A:Analysis> {
 }
 
 ///Struct to represent a running analysis. I think we can keep this internal to papillae
-struct AnalysisJob<F:FrameSource,A:Analysis> {
-	analysis: AnalysisOrPreview<A>,
+struct AnalysisJob<F:IcedFrameSource> {
 	handle: JoinHandle<()>,
 	controltx: Sender<JobMessage<F::PixelType,F::ImageContainerType>>,
 }
@@ -95,10 +95,10 @@ fn parse_str<T: std::str::FromStr>(s:&str) -> Option<T> {
 	}
 }
 
-impl<T:FrameSource,A:Analysis> AnalysisJob<T,A> {
+impl<T:IcedFrameSource> AnalysisJob<T> {
 	///build an `AnalysisJob` from an [Analysis]. `source_fn` should be a function or closure which
 	///returns a valid [FrameSource] when called with no arguments.
-	fn new<F>(analysis:AnalysisOrPreview<A>,source_fn:F,exposure:f64,resolution: [usize;2]) -> AnalysisJob<T,A> where T:FrameSource, F: Fn() -> T + Send, A:Analysis + std::marker::Send,  <T as FrameSource>::ImageContainerType: std::marker::Send, <T as FrameSource>::PixelType: std::marker::Send{
+	fn new<A>(analysis:AnalysisOrPreview<A>,source_fn:fn() -> T,exposure:f64,resolution: [usize;2]) -> AnalysisJob<T> where T:IcedFrameSource, A:Analysis + std::marker::Send,  <T as FrameSource>::ImageContainerType: std::marker::Send, <T as FrameSource>::PixelType: std::marker::Send{
 		let (threadtx, threadrx) = channel::<JobMessage<T::PixelType,T::ImageContainerType>>();
 		let thread_handle = thread::spawn(move || {
             let mut source = source_fn();
@@ -126,16 +126,16 @@ impl<T:FrameSource,A:Analysis> AnalysisJob<T,A> {
                     Err(TryRecvError::Empty) => {}
                 }
                 //grab a frame and process it.
+				//we use the copy we made before we spawned the thread so we can attach the copy we received to the struct we're building
 				match analysis {
 					//maybe we just want to borrow frametx? Going to leave it like this in case we want to pass it to other threads
-					AnalysisOrPreview::Analysis(a) => a.lock().unwrap().process_frame(sourcerx.recv().expect("couldn't grab frame"),frametx.clone()),
+					AnalysisOrPreview::Analysis(ref a) => a.lock().unwrap().process_frame(sourcerx.recv().expect("couldn't grab frame"),frametx.clone()),
 					AnalysisOrPreview::Preview => frametx.try_send(sourcerx.recv().expect("couldn't grab frame").to_image()).expect("couldn't send image"),
 				}
             }
         });
         
-		AnalysisJob::<T,A> {
-			analysis,
+		AnalysisJob::<T> {
 			handle: thread_handle,
 			controltx: threadtx,
 		}
@@ -147,44 +147,44 @@ impl<T:FrameSource,A:Analysis> AnalysisJob<T,A> {
 	}
 }
 
-struct AnalysisInterface<F:IcedFrameSource,A:Analysis,V:Fn() -> F>{
+struct AnalysisInterface<F:IcedFrameSource,A:Analysis>{
 	analysis: Arc<Mutex<A>>,
 	exposure: f64,
 	resolution_1:usize,
 	resolution_2:usize,
 	dispframe: Handle,
-	job: Option<AnalysisJob<F,A>>,
-	source_fn: Box<V>
+	job: Option<AnalysisJob<F>>,
+	source_fn: fn() -> F
 }
 
-struct InterfaceSettings<F:IcedFrameSource,A:Analysis,V:Fn() -> F>{
+struct InterfaceSettings<F:IcedFrameSource,A:Analysis>{
 	analysis:A,
-	source_fn:V,
+	source_fn:fn() -> F,
 	exposure:f64,
 	resolution:[usize;2]
 }
 ///UI for an Analysis
-impl<F:IcedFrameSource,A:Analysis,V:Fn() -> F> AnalysisInterface<F,A,V> {
+impl<F:IcedFrameSource,A:Analysis> AnalysisInterface<F,A> {
 	///Create a new AnalysisInterface
-	fn new(analysis:A,source_fn:V,exposure:f64,resolution:[usize;2]) -> AnalysisInterface<F,A,V>{
+	fn new(analysis:A,source_fn:fn()->F,exposure:f64,resolution:[usize;2]) -> AnalysisInterface<F,A>{
 		let initial_pixels:Vec<u8> = vec![0, 0, 0, 0];
         let initial_handle = Handle::from_pixels(1, 1, initial_pixels);
-		AnalysisInterface::<F,A,V>{
+		AnalysisInterface::<F,A>{
 			analysis: Arc::new(Mutex::new(analysis)),
 			exposure,
-			resolution_1: resolution[1],
-			resolution_2: resolution[2],
+			resolution_1: resolution[0],
+			resolution_2: resolution[1],
 			dispframe: initial_handle,
 			job: None,
-			source_fn: Box::new(source_fn)
+			source_fn: source_fn
 		}
 	}
-	fn new_from_settings(i:InterfaceSettings<F,A,V>) -> AnalysisInterface<F,A,V> {
+	fn new_from_settings(i:InterfaceSettings<F,A>) -> AnalysisInterface<F,A> {
 		AnalysisInterface::new(i.analysis,i.source_fn,i.exposure,i.resolution)
 	}
 	///Build an [iced] UI to display camera controls
 	fn build_cam_ui<T>(&self) -> Column<'_,UiMessage,T,iced::Renderer> where
-	T:iced::widget::button::StyleSheet + iced::widget::text_input::StyleSheet  + iced::widget::text::StyleSheet{
+	T:iced::widget::button::StyleSheet + iced::widget::text_input::StyleSheet  + iced::widget::text::StyleSheet + 'static{
 		//first build our base camera-control center, with the camera view, capture settings
 		//and start/preview buttons
 		let im = Image::new(self.dispframe.clone());
@@ -219,30 +219,31 @@ impl<F:IcedFrameSource,A:Analysis,V:Fn() -> F> AnalysisInterface<F,A,V> {
 				}					
 			});
 			start_button = start_button.on_press(UiMessage::Start);
+			preview_button = preview_button.on_press(UiMessage::Preview);
 		}
 		//group everyone into containers
 		let res1_lab = Column::new().push(text("image height")).push(resolution_1);
 		let res2_lab = Column::new().push(text("image width")).push(resolution_2);
 		let exp_lab = Column::new().push(text("exposure")).push(exposure);
 		let text_row = Row::new().push(exp_lab).push(res1_lab).push(res2_lab);
-		let button_row = Row::new().push(start_button).push(stop_button);
+		let button_row = Row::new().push(preview_button).push(start_button).push(stop_button);
 		//return everyone all formatted
 		Column::new().push(im).push(text_row).push(button_row)
 	}
 	fn get_analysis(&self) -> Arc<Mutex<A>> {
-		self.analysis
+		Arc::clone(&self.analysis)
 	}
 }
 
-impl<F:IcedFrameSource, A:Analysis + Send, V:Fn() -> F + Send> Application for AnalysisInterface<F,A,V> where
+impl<F:IcedFrameSource, A:Analysis + Send> Application for AnalysisInterface<F,A> where
 ImageBuffer<F::PixelType,F::ImageContainerType>:ConvertBuffer<ImageBuffer<Rgba<u8>,Vec<u8>>>{
 	type Message = UiMessage;
     type Executor = executor::Default;
-    type Flags = InterfaceSettings<F,A,V>;
+    type Flags = InterfaceSettings<F,A>;
     type Theme = Theme;
 
-    fn new(flags: Self::Flags) -> (AnalysisInterface<F,A,V>, Command<Self::Message>) {
-        (AnalysisInterface::<F,A,V>::new_from_settings(flags),Command::none())
+    fn new(flags: Self::Flags) -> (AnalysisInterface<F,A>, Command<Self::Message>) {
+        (AnalysisInterface::<F,A>::new_from_settings(flags),Command::none())
     }
 
     fn title(&self) -> String {
@@ -260,8 +261,8 @@ ImageBuffer<F::PixelType,F::ImageContainerType>:ConvertBuffer<ImageBuffer<Rgba<u
             },
 			//fill all of these out
 			UiMessage::Start => {
-				let job = AnalysisJob::<F,A>::new(AnalysisOrPreview::Analysis(Arc::clone(&self.analysis)),self.source_fn,self.exposure,[self.resolution_1,self.resolution_2]);
-				self.job.insert(job);
+				let job = AnalysisJob::<F>::new(AnalysisOrPreview::Analysis(Arc::clone(&self.analysis)),self.source_fn,self.exposure,[self.resolution_1,self.resolution_2]);
+				let _ = self.job.insert(job);
 			},
 			UiMessage::Stop => {
 				self.job.take().expect("should only be able to stop when a job is running").stop();
@@ -271,8 +272,8 @@ ImageBuffer<F::PixelType,F::ImageContainerType>:ConvertBuffer<ImageBuffer<Rgba<u
 			UiMessage::ChangeExposure(e) => self.exposure = e,
 			UiMessage::Pass => {},
 			UiMessage::Preview => {
-				let job = AnalysisJob::<F,A>::new(AnalysisOrPreview::Preview,self.source_fn,self.exposure,[self.resolution_1,self.resolution_2]);
-				self.job.insert(job);
+				let job = AnalysisJob::<F>::new(AnalysisOrPreview::<A>::Preview,self.source_fn,self.exposure,[self.resolution_1,self.resolution_2]);
+				let _ = self.job.insert(job);
 			}				
         }
         Command::none()
@@ -281,7 +282,7 @@ ImageBuffer<F::PixelType,F::ImageContainerType>:ConvertBuffer<ImageBuffer<Rgba<u
 		
 		//we only need a subscription for frames if we're running
 		match self.job {
-		Some(j) => {
+		Some(ref j) => {
         //I think the point of this is to generate a unique id
         struct SomeWorker;
         //clone our sender so the worker can have a copy

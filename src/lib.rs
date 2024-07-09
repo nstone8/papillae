@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 ///trait defining some restrictions on [FrameSource]s we need to play with iced
-trait IcedFrameSource:
+pub trait IcedFrameSource:
     FrameSource<ImageContainerType: Sync + Send, PixelType: Sync + Send + IntoColor<Rgba<u8>>> + 'static
 {
 }
@@ -62,13 +62,11 @@ pub trait Analysis: 'static {
         sender: futures::channel::mpsc::Sender<ImageBuffer<P, T>>,
     );
     ///Display our results to the user as we run
-    fn display_results<'a, Message, Theme: StyleSheet, R: Renderer>(
-        &self,
-    ) -> Container<'a, Message, Theme, R>;
+    fn display_results<'a>(&self) -> Container<'a, UiMessage, Theme, iced::Renderer>;
 }
 
 ///Messages to send to running jobs
-pub enum JobMessage<P: Pixel, C: Deref<Target = [P::Subpixel]>> {
+enum JobMessage<P: Pixel, C: Deref<Target = [P::Subpixel]>> {
     Stop,
     ChangeConsumer(futures::channel::mpsc::Sender<ImageBuffer<P, C>>),
 }
@@ -180,7 +178,7 @@ impl<T: IcedFrameSource> AnalysisJob<T> {
     }
 }
 
-struct AnalysisInterface<F: IcedFrameSource, A: Analysis> {
+pub struct AnalysisInterface<F: IcedFrameSource, A: Analysis> {
     analysis: Arc<Mutex<A>>,
     exposure: f64,
     resolution_1: usize,
@@ -190,11 +188,11 @@ struct AnalysisInterface<F: IcedFrameSource, A: Analysis> {
     source_fn: fn() -> F,
 }
 
-struct InterfaceSettings<F: IcedFrameSource, A: Analysis> {
-    analysis: A,
-    source_fn: fn() -> F,
-    exposure: f64,
-    resolution: [usize; 2],
+pub struct InterfaceSettings<F: IcedFrameSource, A: Analysis> {
+    pub analysis: A,
+    pub source_fn: fn() -> F,
+    pub exposure: f64,
+    pub resolution: [usize; 2],
 }
 ///UI for an Analysis
 impl<F: IcedFrameSource, A: Analysis> AnalysisInterface<F, A> {
@@ -295,11 +293,7 @@ where
         self.get_analysis().lock().unwrap().get_title()
     }
     fn view(&self) -> Element<'_, Self::Message, Self::Theme, iced::Renderer> {
-        let analysis_results = self
-            .get_analysis()
-            .lock()
-            .unwrap()
-            .display_results::<Self::Message, Self::Theme, iced::Renderer>();
+        let analysis_results = self.get_analysis().lock().unwrap().display_results();
         Row::new()
             .push(Self::build_cam_ui::<Self::Theme>(&self))
             .push(analysis_results)

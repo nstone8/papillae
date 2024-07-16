@@ -1,35 +1,16 @@
 use futures;
 use futures::stream::StreamExt;
-use iced::advanced::Renderer;
 use iced::futures::SinkExt;
 use iced::widget::button::Button;
-use iced::widget::container::StyleSheet;
 use iced::widget::image::{Handle, Image};
 use iced::widget::text_input::TextInput;
 use iced::widget::{text, Column, Container, Row};
 use iced::{executor, subscription, Application, Command, Element, Subscription, Theme};
-use image::buffer::ConvertBuffer;
-use image::{ImageBuffer, Pixel, Rgba, RgbaImage};
-use palette::convert::IntoColor;
+use image::DynamicImage;
 use ralston::{Frame, FrameSource};
-use std::ops::Deref;
 use std::sync::mpsc::{channel, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-
-///trait defining some restrictions on [FrameSource]s we need to play with iced
-pub trait IcedFrameSource:
-    FrameSource<ImageContainerType: Sync + Send, PixelType: Sync + Send + IntoColor<Rgba<u8>>> + 'static
-{
-}
-//implement this for all compatible [FrameSource] types
-impl<CT, PT, T: FrameSource<ImageContainerType = CT, PixelType = PT> + 'static> IcedFrameSource
-    for T
-where
-    CT: Sync + Send,
-    PT: Sync + Send + IntoColor<Rgba<u8>>,
-{
-}
 
 /*
 ///A trait representing some type of real time image analysis
@@ -56,19 +37,15 @@ pub trait Analysis: 'static {
     fn get_title(&self) -> String;
     ///process a frame coming off of the source. Argument is `&mut self` in case we want to store results within
     ///the type that implements `Analysis`. The sender is for optional display of the frame
-    fn process_frame<P: Pixel, T: Deref<Target = [P::Subpixel]>>(
-        &mut self,
-        frame: Frame<P, T>,
-        sender: futures::channel::mpsc::Sender<ImageBuffer<P, T>>,
-    );
+    fn process_frame(&mut self, frame: Frame, sender: futures::channel::mpsc::Sender<DynamicImage>);
     ///Display our results to the user as we run
     fn display_results<'a>(&self) -> Container<'a, UiMessage, Theme, iced::Renderer>;
 }
 
 ///Messages to send to running jobs
-enum JobMessage<P: Pixel, C: Deref<Target = [P::Subpixel]>> {
+enum JobMessage {
     Stop,
-    ChangeConsumer(futures::channel::mpsc::Sender<ImageBuffer<P, C>>),
+    ChangeConsumer(futures::channel::mpsc::Sender<DynamicImage>),
 }
 
 ///Messages for driving our iced UI
@@ -91,9 +68,9 @@ enum AnalysisOrPreview<A: Analysis> {
 }
 
 ///Struct to represent a running analysis. I think we can keep this internal to papillae
-struct AnalysisJob<F: IcedFrameSource> {
+struct AnalysisJob {
     handle: JoinHandle<()>,
-    controltx: Sender<JobMessage<F::PixelType, F::ImageContainerType>>,
+    controltx: Sender<JobMessage>,
 }
 
 ///Helper function which parses a string to a numeric type and prints an error
@@ -108,22 +85,19 @@ fn parse_str<T: std::str::FromStr>(s: &str) -> Option<T> {
     }
 }
 
-impl<T: IcedFrameSource> AnalysisJob<T> {
+impl AnalysisJob {
     ///build an `AnalysisJob` from an [Analysis]. `source_fn` should be a function or closure which
     ///returns a valid [FrameSource] when called with no arguments.
-    fn new<A>(
+    fn new<A, T: FrameSource + 'static>(
         analysis: AnalysisOrPreview<A>,
         source_fn: fn() -> T,
         exposure: f64,
         resolution: [usize; 2],
-    ) -> AnalysisJob<T>
+    ) -> AnalysisJob
     where
-        T: IcedFrameSource,
         A: Analysis + std::marker::Send,
-        <T as FrameSource>::ImageContainerType: std::marker::Send,
-        <T as FrameSource>::PixelType: std::marker::Send,
     {
-        let (threadtx, threadrx) = channel::<JobMessage<T::PixelType, T::ImageContainerType>>();
+        let (threadtx, threadrx) = channel::<JobMessage>();
         let thread_handle = thread::spawn(move || {
             let mut source = source_fn();
             //change the exposure
@@ -134,7 +108,7 @@ impl<T: IcedFrameSource> AnalysisJob<T> {
                 panic!("couldn't get a consumer for frames");
             };
             //make a channel for our source
-            let (sourcetx, sourcerx) = channel::<Frame<T::PixelType, T::ImageContainerType>>();
+            let (sourcetx, sourcerx) = channel::<Frame>();
             //start the stream
             let _stream = source.start(sourcetx);
             //shove frames until asked to stop
@@ -164,7 +138,7 @@ impl<T: IcedFrameSource> AnalysisJob<T> {
             }
         });
 
-        AnalysisJob::<T> {
+        AnalysisJob {
             handle: thread_handle,
             controltx: threadtx,
         }
@@ -178,24 +152,24 @@ impl<T: IcedFrameSource> AnalysisJob<T> {
     }
 }
 
-pub struct AnalysisInterface<F: IcedFrameSource, A: Analysis> {
+pub struct AnalysisInterface<F: FrameSource, A: Analysis> {
     analysis: Arc<Mutex<A>>,
     exposure: f64,
     resolution_1: usize,
     resolution_2: usize,
     dispframe: Handle,
-    job: Option<AnalysisJob<F>>,
+    job: Option<AnalysisJob>,
     source_fn: fn() -> F,
 }
 
-pub struct InterfaceSettings<F: IcedFrameSource, A: Analysis> {
+pub struct InterfaceSettings<F: FrameSource, A: Analysis> {
     pub analysis: A,
     pub source_fn: fn() -> F,
     pub exposure: f64,
     pub resolution: [usize; 2],
 }
 ///UI for an Analysis
-impl<F: IcedFrameSource, A: Analysis> AnalysisInterface<F, A> {
+impl<F: FrameSource, A: Analysis> AnalysisInterface<F, A> {
     ///Create a new AnalysisInterface
     fn new(
         analysis: A,
@@ -273,10 +247,7 @@ impl<F: IcedFrameSource, A: Analysis> AnalysisInterface<F, A> {
     }
 }
 
-impl<F: IcedFrameSource, A: Analysis + Send> Application for AnalysisInterface<F, A>
-where
-    ImageBuffer<F::PixelType, F::ImageContainerType>: ConvertBuffer<ImageBuffer<Rgba<u8>, Vec<u8>>>,
-{
+impl<F: FrameSource + 'static, A: Analysis + Send> Application for AnalysisInterface<F, A> {
     type Message = UiMessage;
     type Executor = executor::Default;
     type Flags = InterfaceSettings<F, A>;
@@ -307,7 +278,7 @@ where
             }
             //fill all of these out
             UiMessage::Start => {
-                let job = AnalysisJob::<F>::new(
+                let job = AnalysisJob::new(
                     AnalysisOrPreview::Analysis(Arc::clone(&self.analysis)),
                     self.source_fn,
                     self.exposure,
@@ -326,7 +297,7 @@ where
             UiMessage::ChangeExposure(e) => self.exposure = e,
             UiMessage::Pass => {}
             UiMessage::Preview => {
-                let job = AnalysisJob::<F>::new(
+                let job = AnalysisJob::new(
                     AnalysisOrPreview::<A>::Preview,
                     self.source_fn,
                     self.exposure,
@@ -350,15 +321,14 @@ where
                     100,
                     |mut output| async move {
                         //register our existence with the frame grabber
-                        let (frametx, mut framerx) = futures::channel::mpsc::channel::<
-                            ImageBuffer<F::PixelType, F::ImageContainerType>,
-                        >(30);
+                        let (frametx, mut framerx) =
+                            futures::channel::mpsc::channel::<DynamicImage>(30);
                         threadtx
                             .send(JobMessage::ChangeConsumer(frametx))
                             .expect("couldn't register with frame grabber");
                         loop {
                             let this_image = framerx.select_next_some().await;
-                            let rgba: RgbaImage = this_image.convert();
+                            let rgba = this_image.to_rgba8();
                             let handle = Handle::from_pixels(
                                 rgba.width(),
                                 rgba.height(),

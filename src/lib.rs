@@ -1,5 +1,7 @@
 use futures;
+use futures::future::FusedFuture;
 use futures::stream::StreamExt;
+use futures::task::Poll;
 use iced::futures::SinkExt;
 use iced::widget::button::Button;
 use iced::widget::image::{Handle, Image};
@@ -7,7 +9,9 @@ use iced::widget::text_input::TextInput;
 use iced::widget::{text, Column, Container, Row};
 use iced::{executor, subscription, Application, Command, Element, Subscription, Theme};
 use image::DynamicImage;
-use ralston::{Frame, FrameSource};
+use ralston::{Frame, FrameSource, FrameStream};
+use std::fmt::Debug;
+use std::future::pending;
 use std::sync::mpsc::{channel, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -31,33 +35,43 @@ pub trait Analysis {
 
 //going to make this a 'static type so we can pass it to threads
 pub trait Analysis: 'static {
+    ///Type that can be used to build a visualization of our progress
+    type DisplayData: Default + Debug + Send + Clone;
     ///Need a constructor which takes no arguments for our [iced] application
     fn new() -> Self;
-    ///Return a title for the window
-    fn get_title(&self) -> String;
+    ///Return a title for the window. This is an associated function, not a method
+    fn get_title() -> String;
     ///process a frame coming off of the source. Argument is `&mut self` in case we want to store results within
-    ///the type that implements `Analysis`. The sender is for optional display of the frame
-    fn process_frame(&mut self, frame: Frame, sender: futures::channel::mpsc::Sender<DynamicImage>);
-    ///Display our results to the user as we run
-    fn display_results<'a>(&self) -> Container<'a, UiMessage, Theme, iced::Renderer>;
+    ///the type that implements `Analysis`. The sender is for optional display of a frame. This function should
+    ///return data of type [Self::DisplayData] which can be used by [Self::display_results] to create
+    ///customizable results for the user.
+    fn process_frame(
+        &mut self,
+        frame: Frame,
+        sender: futures::channel::mpsc::Sender<(DynamicImage, Self::DisplayData)>,
+    );
+    ///Build a results display for the user
+    fn display_results(
+        data: &Self::DisplayData,
+    ) -> Container<'_, UiMessage<Self::DisplayData>, Theme, iced::Renderer>;
 }
 
 ///Messages to send to running jobs
-enum JobMessage {
+enum JobMessage<T> {
     Stop,
-    ChangeConsumer(futures::channel::mpsc::Sender<DynamicImage>),
+    ChangeConsumer(futures::channel::mpsc::Sender<(DynamicImage, T)>),
 }
 
 ///Messages for driving our iced UI
 #[derive(Debug, Clone)]
-pub enum UiMessage {
+pub enum UiMessage<T> {
     Start,
     Stop,
     Preview,
     ChangeRes1(usize),
     ChangeRes2(usize),
     ChangeExposure(f64),
-    UpdateFrame(Handle),
+    UpdateFrame((Handle, T)),
     Pass, //in case we don't want to update
 }
 
@@ -68,9 +82,9 @@ enum AnalysisOrPreview<A: Analysis> {
 }
 
 ///Struct to represent a running analysis. I think we can keep this internal to papillae
-struct AnalysisJob {
+struct AnalysisJob<T> {
     handle: JoinHandle<()>,
-    controltx: Sender<JobMessage>,
+    controltx: Sender<JobMessage<T>>,
 }
 
 ///Helper function which parses a string to a numeric type and prints an error
@@ -85,7 +99,7 @@ fn parse_str<T: std::str::FromStr>(s: &str) -> Option<T> {
     }
 }
 
-impl AnalysisJob {
+impl<D: Default + Send + 'static + Clone> AnalysisJob<D> {
     ///build an `AnalysisJob` from an [Analysis]. `source_fn` should be a function or closure which
     ///returns a valid [FrameSource] when called with no arguments.
     fn new<A, T: FrameSource + 'static>(
@@ -93,11 +107,11 @@ impl AnalysisJob {
         source_fn: fn() -> T,
         exposure: f64,
         resolution: [usize; 2],
-    ) -> AnalysisJob
+    ) -> AnalysisJob<D>
     where
-        A: Analysis + std::marker::Send,
+        A: Analysis<DisplayData = D> + std::marker::Send,
     {
-        let (threadtx, threadrx) = channel::<JobMessage>();
+        let (threadtx, threadrx) = channel::<JobMessage<D>>();
         let thread_handle = thread::spawn(move || {
             let mut source = source_fn();
             //change the exposure
@@ -110,7 +124,7 @@ impl AnalysisJob {
             //make a channel for our source
             let (sourcetx, sourcerx) = channel::<Frame>();
             //start the stream
-            let _stream = source.start(sourcetx);
+            let stream = source.start(sourcetx);
             //shove frames until asked to stop
             loop {
                 //check to make sure we're using the right channel and that we should keep going
@@ -132,23 +146,31 @@ impl AnalysisJob {
                         frametx.clone(),
                     ),
                     AnalysisOrPreview::Preview => frametx
-                        .try_send(sourcerx.recv().expect("couldn't grab frame").to_image())
+                        //we will send the default value of D for the result display
+                        .try_send((
+                            sourcerx.recv().expect("couldn't grab frame").to_image(),
+                            Default::default(),
+                        ))
                         .expect("couldn't send image"),
                 }
             }
+            println!("hit end of thread, stopping stream");
+            stream.stop();
         });
 
-        AnalysisJob {
+        AnalysisJob::<D> {
             handle: thread_handle,
             controltx: threadtx,
         }
     }
     ///stop a running job
     fn stop(self) {
+        println!("attempting to stop job");
         self.controltx
             .send(JobMessage::Stop)
             .expect("Couldn't communicate to running job");
         self.handle.join().expect("job failed to stop");
+        println!("joined thread");
     }
 }
 
@@ -158,8 +180,9 @@ pub struct AnalysisInterface<F: FrameSource, A: Analysis> {
     resolution_1: usize,
     resolution_2: usize,
     dispframe: Handle,
-    job: Option<AnalysisJob>,
+    job: Option<AnalysisJob<A::DisplayData>>,
     source_fn: fn() -> F,
+    display_data: A::DisplayData,
 }
 
 pub struct InterfaceSettings<F: FrameSource, A: Analysis> {
@@ -187,13 +210,14 @@ impl<F: FrameSource, A: Analysis> AnalysisInterface<F, A> {
             dispframe: initial_handle,
             job: None,
             source_fn: source_fn,
+            display_data: Default::default(),
         }
     }
     fn new_from_settings(i: InterfaceSettings<F, A>) -> AnalysisInterface<F, A> {
         AnalysisInterface::new(i.analysis, i.source_fn, i.exposure, i.resolution)
     }
     ///Build an [iced] UI to display camera controls
-    fn build_cam_ui<T>(&self) -> Column<'_, UiMessage, T, iced::Renderer>
+    fn build_cam_ui<T>(&self) -> Column<'_, UiMessage<A::DisplayData>, T, iced::Renderer>
     where
         T: iced::widget::button::StyleSheet
             + iced::widget::text_input::StyleSheet
@@ -207,28 +231,29 @@ impl<F: FrameSource, A: Analysis> AnalysisInterface<F, A> {
         let mut exposure = TextInput::new("exposure time", &self.exposure.to_string());
         let mut resolution_1 = TextInput::new("h", &self.resolution_1.to_string());
         let mut resolution_2 = TextInput::new("w", &self.resolution_2.to_string());
-        let mut preview_button: Button<UiMessage, T, iced::Renderer> = Button::new("preview");
+        let mut preview_button: Button<UiMessage<A::DisplayData>, T, iced::Renderer> =
+            Button::new("preview");
         let mut start_button = Button::new("start");
         let mut stop_button = Button::new("stop");
         if self.job.is_some() {
             //only the stop button should be enabled
-            stop_button = stop_button.on_press(UiMessage::Stop);
+            stop_button = stop_button.on_press(UiMessage::<A::DisplayData>::Stop);
         } else {
             //we should be allowed to edit everything or start
             resolution_1 = resolution_1.on_input(|s| match parse_str::<usize>(&s) {
-                Some(num) => UiMessage::ChangeRes1(num),
-                None => UiMessage::Pass,
+                Some(num) => UiMessage::<A::DisplayData>::ChangeRes1(num),
+                None => UiMessage::<A::DisplayData>::Pass,
             });
             resolution_2 = resolution_2.on_input(|s| match parse_str::<usize>(&s) {
-                Some(num) => UiMessage::ChangeRes2(num),
-                None => UiMessage::Pass,
+                Some(num) => UiMessage::<A::DisplayData>::ChangeRes2(num),
+                None => UiMessage::<A::DisplayData>::Pass,
             });
             exposure = exposure.on_input(|s| match parse_str::<f64>(&s) {
-                Some(num) => UiMessage::ChangeExposure(num),
-                None => UiMessage::Pass,
+                Some(num) => UiMessage::<A::DisplayData>::ChangeExposure(num),
+                None => UiMessage::<A::DisplayData>::Pass,
             });
-            start_button = start_button.on_press(UiMessage::Start);
-            preview_button = preview_button.on_press(UiMessage::Preview);
+            start_button = start_button.on_press(UiMessage::<A::DisplayData>::Start);
+            preview_button = preview_button.on_press(UiMessage::<A::DisplayData>::Preview);
         }
         //group everyone into containers
         let res1_lab = Column::new().push(text("image height")).push(resolution_1);
@@ -248,7 +273,7 @@ impl<F: FrameSource, A: Analysis> AnalysisInterface<F, A> {
 }
 
 impl<F: FrameSource + 'static, A: Analysis + Send> Application for AnalysisInterface<F, A> {
-    type Message = UiMessage;
+    type Message = UiMessage<A::DisplayData>;
     type Executor = executor::Default;
     type Flags = InterfaceSettings<F, A>;
     type Theme = Theme;
@@ -261,20 +286,20 @@ impl<F: FrameSource + 'static, A: Analysis + Send> Application for AnalysisInter
     }
 
     fn title(&self) -> String {
-        self.get_analysis().lock().unwrap().get_title()
+        A::get_title()
     }
     fn view(&self) -> Element<'_, Self::Message, Self::Theme, iced::Renderer> {
-        let analysis_results = self.get_analysis().lock().unwrap().display_results();
         Row::new()
             .push(Self::build_cam_ui::<Self::Theme>(&self))
-            .push(analysis_results)
+            .push(<A as Analysis>::display_results(&self.display_data))
             .into()
     }
     //pick up here, deal with mutable analyses
     fn update(&mut self, m: Self::Message) -> Command<Self::Message> {
         match m {
-            UiMessage::UpdateFrame(handle) => {
+            UiMessage::UpdateFrame((handle, display_data)) => {
                 self.dispframe = handle;
+                self.display_data = display_data;
             }
             //fill all of these out
             UiMessage::Start => {
@@ -310,8 +335,10 @@ impl<F: FrameSource + 'static, A: Analysis + Send> Application for AnalysisInter
     }
     fn subscription(&self) -> subscription::Subscription<Self::Message> {
         //we only need a subscription for frames if we're running
+        println!("calling subscription");
         match self.job {
             Some(ref j) => {
+                println!("some job");
                 //I think the point of this is to generate a unique id
                 struct SomeWorker;
                 //clone our sender so the worker can have a copy
@@ -322,27 +349,41 @@ impl<F: FrameSource + 'static, A: Analysis + Send> Application for AnalysisInter
                     |mut output| async move {
                         //register our existence with the frame grabber
                         let (frametx, mut framerx) =
-                            futures::channel::mpsc::channel::<DynamicImage>(30);
+                            futures::channel::mpsc::channel::<(DynamicImage, A::DisplayData)>(30);
                         threadtx
                             .send(JobMessage::ChangeConsumer(frametx))
                             .expect("couldn't register with frame grabber");
+                        println!("registered with frame grabber");
                         loop {
-                            let this_image = framerx.select_next_some().await;
-                            let rgba = this_image.to_rgba8();
-                            let handle = Handle::from_pixels(
-                                rgba.width(),
-                                rgba.height(),
-                                rgba.as_raw().clone(),
-                            );
-                            output
-                                .send(UiMessage::UpdateFrame(handle))
-                                .await
-                                .expect("couldn't send frame in subscription");
+                            if let Some((this_image, display_data)) = framerx.next().await {
+                                println!("frame to subscription");
+                                let rgba = this_image.to_rgba8();
+                                let handle = Handle::from_pixels(
+                                    rgba.width(),
+                                    rgba.height(),
+                                    rgba.as_raw().clone(),
+                                );
+                                output
+                                    .send(UiMessage::UpdateFrame::<A::DisplayData>((
+                                        handle,
+                                        display_data,
+                                    )))
+                                    .await
+                                    .expect("couldn't send frame in subscription");
+                                println!("sent updateframe message");
+                            } else {
+                                println!("pipe closed");
+                                //wait for iced to kill this thread
+                                let () = pending().await;
+                            }
                         }
                     },
                 )
             }
-            None => Subscription::<UiMessage>::none(), //fill me out
+            None => {
+                println!("no job");
+                Subscription::<UiMessage<A::DisplayData>>::none()
+            } //fill me out
         }
     }
 }

@@ -1,7 +1,5 @@
 use futures;
-use futures::future::FusedFuture;
 use futures::stream::StreamExt;
-use futures::task::Poll;
 use iced::futures::SinkExt;
 use iced::widget::button::Button;
 use iced::widget::image::{Handle, Image};
@@ -154,7 +152,6 @@ impl<D: Default + Send + 'static + Clone> AnalysisJob<D> {
                         .expect("couldn't send image"),
                 }
             }
-            println!("hit end of thread, stopping stream");
             stream.stop();
         });
 
@@ -165,12 +162,10 @@ impl<D: Default + Send + 'static + Clone> AnalysisJob<D> {
     }
     ///stop a running job
     fn stop(self) {
-        println!("attempting to stop job");
         self.controltx
             .send(JobMessage::Stop)
             .expect("Couldn't communicate to running job");
         self.handle.join().expect("job failed to stop");
-        println!("joined thread");
     }
 }
 
@@ -267,9 +262,11 @@ impl<F: FrameSource, A: Analysis> AnalysisInterface<F, A> {
         //return everyone all formatted
         Column::new().push(im).push(text_row).push(button_row)
     }
+    /*
     fn get_analysis(&self) -> Arc<Mutex<A>> {
         Arc::clone(&self.analysis)
     }
+    */
 }
 
 impl<F: FrameSource + 'static, A: Analysis + Send> Application for AnalysisInterface<F, A> {
@@ -335,10 +332,8 @@ impl<F: FrameSource + 'static, A: Analysis + Send> Application for AnalysisInter
     }
     fn subscription(&self) -> subscription::Subscription<Self::Message> {
         //we only need a subscription for frames if we're running
-        println!("calling subscription");
         match self.job {
             Some(ref j) => {
-                println!("some job");
                 //I think the point of this is to generate a unique id
                 struct SomeWorker;
                 //clone our sender so the worker can have a copy
@@ -353,10 +348,8 @@ impl<F: FrameSource + 'static, A: Analysis + Send> Application for AnalysisInter
                         threadtx
                             .send(JobMessage::ChangeConsumer(frametx))
                             .expect("couldn't register with frame grabber");
-                        println!("registered with frame grabber");
                         loop {
                             if let Some((this_image, display_data)) = framerx.next().await {
-                                println!("frame to subscription");
                                 let rgba = this_image.to_rgba8();
                                 let handle = Handle::from_pixels(
                                     rgba.width(),
@@ -370,9 +363,7 @@ impl<F: FrameSource + 'static, A: Analysis + Send> Application for AnalysisInter
                                     )))
                                     .await
                                     .expect("couldn't send frame in subscription");
-                                println!("sent updateframe message");
                             } else {
-                                println!("pipe closed");
                                 //wait for iced to kill this thread
                                 let () = pending().await;
                             }
@@ -381,9 +372,8 @@ impl<F: FrameSource + 'static, A: Analysis + Send> Application for AnalysisInter
                 )
             }
             None => {
-                println!("no job");
                 Subscription::<UiMessage<A::DisplayData>>::none()
-            } //fill me out
+            }
         }
     }
 }

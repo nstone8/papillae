@@ -14,6 +14,10 @@ use std::sync::mpsc::{channel, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
+//reexport some stuff for our callers
+pub use iced;
+pub use ralston;
+
 /*
 ///A trait representing some type of real time image analysis
 pub trait Analysis {
@@ -371,9 +375,7 @@ impl<F: FrameSource + 'static, A: Analysis + Send> Application for AnalysisInter
                     },
                 )
             }
-            None => {
-                Subscription::<UiMessage<A::DisplayData>>::none()
-            }
+            None => Subscription::<UiMessage<A::DisplayData>>::none(),
         }
     }
 }

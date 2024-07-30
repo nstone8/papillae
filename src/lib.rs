@@ -17,6 +17,8 @@ use std::thread::{self, JoinHandle};
 //reexport some stuff for our callers
 pub use iced;
 pub use ralston;
+pub use futures;
+pub use image;
 
 /*
 ///A trait representing some type of real time image analysis

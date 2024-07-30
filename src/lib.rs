@@ -1,4 +1,8 @@
-use futures;
+//reexport some stuff for our callers
+pub use iced;
+pub use ralston;
+pub use futures;
+
 use futures::stream::StreamExt;
 use iced::futures::SinkExt;
 use iced::widget::button::Button;
@@ -6,18 +10,13 @@ use iced::widget::image::{Handle, Image};
 use iced::widget::text_input::TextInput;
 use iced::widget::{text, Column, Container, Row};
 use iced::{executor, subscription, Application, Command, Element, Subscription, Theme};
-use ralston::{self, Frame, FrameSource, FrameStream, image};
-use image::DynamicImage;
+use ralston::{Frame, FrameSource, FrameStream};
+use ralston::image::DynamicImage;
 use std::fmt::Debug;
 use std::future::pending;
 use std::sync::mpsc::{channel, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-
-//reexport some stuff for our callers
-pub use iced;
-pub use ralston;
-pub use futures;
 
 /*
 ///A trait representing some type of real time image analysis

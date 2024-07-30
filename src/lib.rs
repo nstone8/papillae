@@ -39,8 +39,8 @@ pub trait Analysis {
 pub trait Analysis: 'static {
     ///Type that can be used to build a visualization of our progress
     type DisplayData: Default + Debug + Send + Clone;
-    ///Need a constructor which takes no arguments for our [iced] application
-    fn new() -> Self;
+    //Need a constructor which takes no arguments for our [iced] application
+    //fn new() -> Self;
     ///Return a title for the window. This is an associated function, not a method
     fn get_title() -> String;
     ///process a frame coming off of the source. Argument is `&mut self` in case we want to store results within

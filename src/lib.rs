@@ -182,6 +182,7 @@ pub struct AnalysisInterface<F: FrameSource, A: Analysis> {
     job: Option<AnalysisJob<A::DisplayData>>,
     source_fn: fn() -> F,
     display_data: A::DisplayData,
+    display_buffer: usize,
 }
 
 pub struct InterfaceSettings<F: FrameSource, A: Analysis> {
@@ -189,6 +190,7 @@ pub struct InterfaceSettings<F: FrameSource, A: Analysis> {
     pub source_fn: fn() -> F,
     pub exposure: f64,
     pub resolution: [usize; 2],
+    pub display_buffer: usize,
 }
 ///UI for an Analysis
 impl<F: FrameSource, A: Analysis> AnalysisInterface<F, A> {
@@ -198,6 +200,7 @@ impl<F: FrameSource, A: Analysis> AnalysisInterface<F, A> {
         source_fn: fn() -> F,
         exposure: f64,
         resolution: [usize; 2],
+	display_buffer: usize
     ) -> AnalysisInterface<F, A> {
         let initial_pixels: Vec<u8> = vec![0, 0, 0, 0];
         let initial_handle = Handle::from_pixels(1, 1, initial_pixels);
@@ -210,10 +213,11 @@ impl<F: FrameSource, A: Analysis> AnalysisInterface<F, A> {
             job: None,
             source_fn: source_fn,
             display_data: Default::default(),
+	    display_buffer,
         }
     }
     fn new_from_settings(i: InterfaceSettings<F, A>) -> AnalysisInterface<F, A> {
-        AnalysisInterface::new(i.analysis, i.source_fn, i.exposure, i.resolution)
+        AnalysisInterface::new(i.analysis, i.source_fn, i.exposure, i.resolution,i.display_buffer)
     }
     ///Build an [iced] UI to display camera controls
     fn build_cam_ui<T>(&self) -> Column<'_, UiMessage<A::DisplayData>, T, iced::Renderer>
@@ -342,13 +346,15 @@ impl<F: FrameSource + 'static, A: Analysis + Send> Application for AnalysisInter
                 struct SomeWorker;
                 //clone our sender so the worker can have a copy
                 let threadtx = j.controltx.clone();
+		//make a local copy of self.display_buffer that can be sent to the subscription
+		let display_buffer = self.display_buffer.clone();
                 subscription::channel(
                     std::any::TypeId::of::<SomeWorker>(),
                     100,
-                    |mut output| async move {
+                    move |mut output| async move {
                         //register our existence with the frame grabber
                         let (frametx, mut framerx) =
-                            futures::channel::mpsc::channel::<(DynamicImage, A::DisplayData)>(30);
+                            futures::channel::mpsc::channel::<(DynamicImage, A::DisplayData)>(display_buffer);
                         threadtx
                             .send(JobMessage::ChangeConsumer(frametx))
                             .expect("couldn't register with frame grabber");

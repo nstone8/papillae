@@ -8,7 +8,7 @@ use iced::futures::SinkExt;
 use iced::widget::button::Button;
 use iced::widget::image::{Handle, Image};
 use iced::widget::text_input::TextInput;
-use iced::widget::{text, Column, Container, Row};
+use iced::widget::{scrollable, text, Column, Container, Row};
 use iced::{executor, subscription, Application, Command, Element, Subscription, Theme};
 use ralston::image::DynamicImage;
 use ralston::{Frame, FrameSource, FrameStream};
@@ -300,10 +300,12 @@ impl<F: FrameSource + 'static, A: Analysis + Send> Application for AnalysisInter
         A::get_title()
     }
     fn view(&self) -> Element<'_, Self::Message, Self::Theme, iced::Renderer> {
-        Row::new()
-            .push(Self::build_cam_ui::<Self::Theme>(&self))
-            .push(<A as Analysis>::display_results(&self.display_data))
-            .into()
+        scrollable(
+            Row::new()
+                .push(Self::build_cam_ui::<Self::Theme>(&self))
+                .push(<A as Analysis>::display_results(&self.display_data)),
+        )
+        .into()
     }
     //pick up here, deal with mutable analyses
     fn update(&mut self, m: Self::Message) -> Command<Self::Message> {

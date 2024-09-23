@@ -304,7 +304,10 @@ impl<F: FrameSource + 'static, A: Analysis + Send> Application for AnalysisInter
     fn view(&self) -> Element<'_, Self::Message, Self::Theme, iced::Renderer> {
         //we'll stack the average pixel value on top of the analysis result data
         let disp = Column::new()
-            .push(text(format!("{}", self.avg_pixel_intensity)))
+            .push(text(format!(
+                "average pixel intensity: {:.1}",
+                self.avg_pixel_intensity
+            )))
             .push(<A as Analysis>::display_results(&self.display_data));
         scrollable(
             Row::new()
@@ -383,9 +386,9 @@ impl<F: FrameSource + 'static, A: Analysis + Send> Application for AnalysisInter
                                         let dims = luma_image.dimensions();
                                         let pix_sum: f64 = luma_image.pixels().
 					//need to convert to numeric from a one-length array
-					map(|p| -> u16 {
-					    p.0[0]
-					}).sum::<u16>().into();
+					map(|p| -> f64 {
+					    p.0[0].into()
+					}).sum::<f64>();
                                         let num_pix: f64 = (dims.0 * dims.1).into();
                                         pix_sum / num_pix
                                     } else {

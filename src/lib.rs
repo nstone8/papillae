@@ -73,7 +73,7 @@ pub enum UiMessage<T> {
     ChangeRes1(usize),
     ChangeRes2(usize),
     ChangeExposure(f64),
-    UpdateFrame((Handle, T)),
+    UpdateFrame((Handle, T, f64)),
     Pass, //in case we don't want to update
 }
 
@@ -183,6 +183,7 @@ pub struct AnalysisInterface<F: FrameSource, A: Analysis> {
     source_fn: fn() -> F,
     display_data: A::DisplayData,
     process_buffer: usize,
+    avg_pixel_intensity: f64,
 }
 
 pub struct InterfaceSettings<F: FrameSource, A: Analysis> {
@@ -214,6 +215,7 @@ impl<F: FrameSource, A: Analysis> AnalysisInterface<F, A> {
             source_fn: source_fn,
             display_data: Default::default(),
             process_buffer,
+            avg_pixel_intensity: 0.0,
         }
     }
     fn new_from_settings(i: InterfaceSettings<F, A>) -> AnalysisInterface<F, A> {
@@ -300,19 +302,24 @@ impl<F: FrameSource + 'static, A: Analysis + Send> Application for AnalysisInter
         A::get_title()
     }
     fn view(&self) -> Element<'_, Self::Message, Self::Theme, iced::Renderer> {
+        //we'll stack the average pixel value on top of the analysis result data
+        let disp = Column::new()
+            .push(text(format!("{}", self.avg_pixel_intensity)))
+            .push(<A as Analysis>::display_results(&self.display_data));
         scrollable(
             Row::new()
                 .push(Self::build_cam_ui::<Self::Theme>(&self))
-                .push(<A as Analysis>::display_results(&self.display_data)),
+                .push(disp),
         )
         .into()
     }
     //pick up here, deal with mutable analyses
     fn update(&mut self, m: Self::Message) -> Command<Self::Message> {
         match m {
-            UiMessage::UpdateFrame((handle, display_data)) => {
+            UiMessage::UpdateFrame((handle, display_data, pixel_intensity)) => {
                 self.dispframe = handle;
                 self.display_data = display_data;
+                self.avg_pixel_intensity = pixel_intensity
             }
             //fill all of these out
             UiMessage::Start => {
@@ -370,6 +377,20 @@ impl<F: FrameSource + 'static, A: Analysis + Send> Application for AnalysisInter
                             .expect("couldn't register with frame grabber");
                         loop {
                             if let Some((this_image, display_data)) = framerx.next().await {
+                                //if this_image is Luma, calculate a average intensity value
+                                let avg_pixel_intensity: f64 =
+                                    if let DynamicImage::ImageLuma16(luma_image) = &this_image {
+                                        let dims = luma_image.dimensions();
+                                        let pix_sum: f64 = luma_image.pixels().
+					//need to convert to numeric from a one-length array
+					map(|p| -> u16 {
+					    p.0[0]
+					}).sum::<u16>().into();
+                                        let num_pix: f64 = (dims.0 * dims.1).into();
+                                        pix_sum / num_pix
+                                    } else {
+                                        0.0
+                                    };
                                 let rgba = this_image.to_rgba8();
                                 let handle = Handle::from_pixels(
                                     rgba.width(),
@@ -380,6 +401,7 @@ impl<F: FrameSource + 'static, A: Analysis + Send> Application for AnalysisInter
                                     .send(UiMessage::UpdateFrame::<A::DisplayData>((
                                         handle,
                                         display_data,
+                                        avg_pixel_intensity,
                                     )))
                                     .await
                                     .expect("couldn't send frame in subscription");
